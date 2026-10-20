@@ -67,3 +67,5 @@ A change to what the image does bumps `VERSION` and gets a line under "Versions"
   /dev/null; Saved/Logs/WS.log (a link to the local log folder) is tailed to docker logs instead.
 - **Empty env = unset**: the marketplace writes blank declared parameters as `NAME=`.
 - **Flux stops a container with Docker's default 10 seconds.**
+- **`flux.log` is local** (`$FLUX_SERVER_DIR/flux-logs/flux.log`, 5 MB then one `.1`), never on the synced data volume: a constantly written file there is constant Syncthing traffic. `flux_log_migrate` moves an old one off the data volume at start. `flux_banner` prints the FluxCloud banner at container start and every generation; its text is tested.
+- **The scheduled CI run publishes only with something to apply** (`.github/ci/needs-rebuild.sh`): urgent security updates, or commits on main since the published `:latest` (label `org.opencontainers.image.revision`) that touch the image inputs.

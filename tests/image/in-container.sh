@@ -115,5 +115,14 @@ check "after a save" "3" "$(grep -c 'saved: WORLD IS SAVED' /tmp/entry.log)"
 check "and says stopped" "stopped" "$(jstate state)"
 check "the server's files are uid 1000" "0" "$(find ${data}/Saved ${server} ! -uid 1000 | wc -l)"
 
+# --- flux.log is local; the banner ----------------------------------------------------------------
+fl_srv=/mnt/soulmask/server
+fl_data=/mnt/soulmask/data
+check "flux.log is on the install volume" "0" "$(status test -s "${fl_srv}/flux-logs/flux.log")"
+check "and not on the synced data volume" "1" "$(status test -e "${fl_data}/flux/flux.log")"
+check "the banner is in the container output" "0" "$(status grep -q 'Soulmask server image by FluxCloud - https://runonflux.com' /tmp/entry.log)"
+check "and in flux.log" "0" "$(status grep -q 'Host this and 30+ other games in one click: https://runonflux.com/games' "${fl_srv}/flux-logs/flux.log")"
+check "at the container start and again for each generation" "1" "$([ "$(grep -c 'server image by FluxCloud' /tmp/entry.log)" -ge 2 ] && echo 1 || echo 0)"
+
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [ "${fail}" = "0" ] || { echo '--- entrypoint log'; cat /tmp/entry.log; exit 1; }

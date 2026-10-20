@@ -48,6 +48,9 @@ sm() { python3 /opt/flux/fluxsm.py "$@"; }
 
 rm -f "${FLUX_RESTART_MARKER}"
 mkdir -p "${s}" "${FLUX_SAVED_DIR}" "${FLUX_STATE_DIR}" "${FLUX_GAME_LOG_DIR}" "${FLUX_STATE_DIR}/uploads"
+# An older image kept flux.log on the synced data volume: move it here, once.
+flux_log_migrate "${FLUX_STATE_DIR}/flux.log"
+flux_banner "Soulmask"
 # A container killed mid-run leaves state.json saying "running": say what is true before anything
 # else, so the panel does not read the last container's state.
 sm state updating "Starting the container"
@@ -354,6 +357,7 @@ start_generation() {
   [ "${terminating}" = "1" ] && return 2
 
   sm state starting "Loading the world"
+  flux_banner "Soulmask"
   flux_log "starting the server (generation ${generation})"
 
   # The game's log (Saved/Logs/WS.log), onto the container's output. The server's own stdout

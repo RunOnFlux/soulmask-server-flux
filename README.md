@@ -26,8 +26,8 @@ on every start, run as uid 1000 under a supervisor that:
 
 | Path | Flux mount | What |
 |---|---|---|
-| `/mnt/soulmask/data` | `g:` (synced) | `Saved/` (the game's: `Worlds/Dedicated/<map>/world.db`, `GameplaySettings/GameXishu.json`, `BlackAccountList.txt`; the install's `WS/Saved` is a link to it) and `flux/` (our log, state, `gameplay.json`, uploads, backups) |
-| `/mnt/soulmask/server` | `ml:server` (local) | the game install, about 2.2 GB, and the game's logs (`flux-logs/`, which `Saved/Logs` links to). Downloaded again on a new node |
+| `/mnt/soulmask/data` | `g:` (synced) | `Saved/` (the game's: `Worlds/Dedicated/<map>/world.db`, `GameplaySettings/GameXishu.json`, `BlackAccountList.txt`; the install's `WS/Saved` is a link to it) and `flux/` (state, `gameplay.json`, uploads, backups) |
+| `/mnt/soulmask/server` | `ml:server` (local) | the game install, about 2.2 GB, and the game's logs (`flux-logs/`, which `Saved/Logs` links to). Downloaded again on a new node Also `flux-logs/flux.log` (our supervisor log, 5 MB then one `.1`): local, never synced. |
 
 Spec: `g:/mnt/soulmask/data|ml:server:/mnt/soulmask/server`.
 
@@ -106,3 +106,4 @@ Commands, run through appexec. Each prints one JSON document, except `console`.
 ## Versions
 
 - **1.0.0** (2026-10-18): first release.
+- **1.0.1** (2026-10-20): `flux.log` moved off the synced data volume to `/mnt/soulmask/server/flux-logs/flux.log` (5 MB, one `.1`; an old one is moved there once); start-up banner; the weekly rebuild only when it has something to apply.
