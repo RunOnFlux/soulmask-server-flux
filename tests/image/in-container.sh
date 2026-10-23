@@ -4,6 +4,9 @@
 # and scripts/ at /s.
 set -uo pipefail
 export LC_ALL=C
+# The world guard waits 5 min for Syncthing before it puts a backup back (tests/test-flux.sh tests
+# that wait); here the missing world is put back at once.
+export FLUX_WORLD_SYNC_GRACE_SECONDS=0
 
 pass=0
 fail=0
@@ -55,6 +58,7 @@ done
 mkdir -p "${dir}/linux64" "${dir}/WS/Binaries/Linux" "${dir}/WS/Config/GameplaySettings" "${dir}/steamapps"
 printf '"AppState"\n{\n\t"buildid"\t\t"100"\n}\n' >"${dir}/steamapps/appmanifest_3017300.acf"
 printf '{"0": {"ExpRatio": 1, "MaxLevel": 60}, "1": {"ExpRatio": 1, "MaxLevel": 60}, "2": {"ExpRatio": 1, "MaxLevel": 60}}\n' >"${dir}/WS/Config/GameplaySettings/GameXishu_Template.json"
+printf '{"0": {"ExpRatio": 3}, "1": {"ExpRatio": 3}, "2": {"ExpRatio": 3}}\n' >"${dir}/WS/Config/GameplaySettings/GameXishu_Template_Fast.json"
 cp /t/image/standin-server.py "${dir}/WS/Binaries/Linux/WSServer-Linux-Shipping"
 chmod +x "${dir}/WS/Binaries/Linux/WSServer-Linux-Shipping"
 STUB
@@ -83,28 +87,52 @@ check "apply-live sets what differs" "1" "$(flux-soulmask apply-live | python3 -
 check "the server wrote it" "4" "$(python3 -c 'import json;print(json.load(open("'"${data}"'/Saved/GameplaySettings/GameXishu.json"))["1"]["ExpRatio"])')"
 check "a panel backup" "True" "$(flux-soulmask backup manual force | python3 -c 'import json,sys;print(json.load(sys.stdin)["ok"])')"
 check "made after a forced save" "0" "$(status test -f ${data}/Saved/Worlds/Dedicated/Level01_Main/world.db)"
+check "the passwords never reach docker logs" "0" "$(grep -c 'gm1' /tmp/entry.log)"
+check "the command line is there, hidden" "1" "$(grep -c -- '-adminpsw=<hidden>' /tmp/entry.log)"
+check "the first forced save comes before running" "1" "$(grep -c 'first forced save in' /tmp/entry.log)"
+check "status: lastAction is null before any" "None" "$(flux-soulmask status | python3 -c 'import json,sys;print(json.load(sys.stdin)["lastAction"])')"
+# The whitelist, live.
+check "whitelist add, live" '{"ok": true}' "$(flux-soulmask whitelist add 76561198000000001)"
+check "whitelist on, live: no restart" '{"ok": true, "restart": false}' "$(flux-soulmask whitelist on)"
+check "whitelist: on, with the player's name" '{"enabled": true, "ids": [{"id": "76561198000000001", "name": "Chief Ana"}]}' "$(flux-soulmask whitelist)"
+check "in the game's file" "76561198000000001" "$(cat ${data}/Saved/WhiteAccountList.txt)"
+# preset -> apply-live -> a GM's sc in game -> restart: all of it kept (1.0.1 took the stale block
+# "0" back and reverted everything).
+flux-soulmask preset Fast >/dev/null
+check "apply-live after a preset" "True" "$(flux-soulmask apply-live | python3 -c 'import json,sys;print(json.load(sys.stdin)["ok"])')"
+flux-soulmask console sc MaxLevel 70 >/dev/null
 
 flux-soulmask restart >/dev/null
 check "a panel restart starts generation 2" "0" "$(status wait_for '[ "$(jstate generation)" = 2 ] && [ "$(jstate state)" = running ]' 30)"
 check "the restart was not counted as a crash" "0" "$(grep -c 'restarts within' /tmp/entry.log)"
 check "it saved first" "1" "$(grep -c 'saved: WORLD IS SAVED' /tmp/entry.log)"
+check "the restart kept the preset's apply-live and the GM's sc" "3 70" "$(python3 -c 'import json;d=json.load(open("'"${data}"'/Saved/GameplaySettings/GameXishu.json"))["1"];print(d["ExpRatio"],d["MaxLevel"])')"
+check "and the panel has both" "3 70" "$(python3 -c 'import json;d=json.load(open("'"${data}"'/flux/gameplay.json"));print(d["ExpRatio"],d["MaxLevel"])')"
+check "the whitelist is on again after the restart (-serverpm)" "True" "$(flux-soulmask whitelist | python3 -c 'import json,sys;print(json.load(sys.stdin)["enabled"])')"
+flux-soulmask whitelist off >/dev/null
 
 flux-soulmask restart 10 >/dev/null
 check "a countdown restart lets the game exit on its own" "0" "$(status wait_for '[ "$(jstate generation)" = 3 ] && [ "$(jstate state)" = running ]' 40)"
 check "and is a planned one" "0" "$(grep -c 'ended on its own' /tmp/entry.log)"
 
 # A restore through the panel's command: the supervisor restarts, restores, starts again.
-echo after >"${data}/Saved/Worlds/Dedicated/Level01_Main/marker.txt"
+marker_tables() { python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("select count(*) from sqlite_master where name = ?", ("marker",)).fetchone()[0])' "${data}/Saved/Worlds/Dedicated/Level01_Main/world.db" 2>/dev/null; }
+python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("create table marker(v)"); c.commit()' "${data}/Saved/Worlds/Dedicated/Level01_Main/world.db"
 backup="$(flux-soulmask backups | python3 -c 'import json,sys;print(json.load(sys.stdin)["backups"][0]["name"])')"
 check "restore restarts the running server" "True" "$(flux-soulmask restore "${backup}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["serverQuit"])')"
-check "and the next start has the backup's worlds" "0" "$(status wait_for '[ "$(jstate generation)" = 4 ] && [ ! -f ${data}/Saved/Worlds/Dedicated/Level01_Main/marker.txt ]' 40)"
+check "and the next start has the backup's worlds" "0" "$(status wait_for '[ "$(jstate generation)" = 4 ] && [ "$(marker_tables)" = 0 ]' 40)"
 check "a safety backup was made first" "0" "$(status grep -q 'before restoring' <(flux-soulmask backups))"
+check "lastAction: the restore, by this generation" "restore ${backup} 4 True" "$(flux-soulmask status | python3 -c 'import json,sys;a=json.load(sys.stdin)["lastAction"];print(a["kind"],a["name"],a["generation"],a["ok"])')"
 
 # The server dying on its own: restarted in place, counted.
 wait_for '[ "$(jstate state)" = running ]' 20
+# A half-synced volume: the world.db is gone when the next start comes (here, after a crash).
+rm -f ${data}/Saved/Worlds/Dedicated/Level01_Main/world.db
 pkill -KILL -f '/WSServer-Linux-Shipping '
 check "a crash is restarted in place" "0" "$(status wait_for '[ "$(jstate generation)" = 5 ] && [ "$(jstate state)" = running ]' 40)"
 check "and counted" "1" "$(grep -c 'ended on its own' /tmp/entry.log)"
+check "the missing world came back from a backup, not as a new one" "1" "$(grep -c 'restored the newest backup that has it' /tmp/entry.log)"
+check "status says it" "Level01_Main" "$(python3 -c 'import json;print(json.load(open("'"${data}"'/flux/state.json"))["worldRestored"]["map"])')"
 
 wait_for '[ "$(jstate state)" = running ]' 20
 s=$(date +%s)
@@ -113,7 +141,17 @@ check "a stop ends the supervisor" "0" "$(status wait_for '! kill -0 ${entry} 2>
 check "inside Docker's 10 s" "1" "$([ $(($(date +%s) - s)) -lt 10 ] && echo 1 || echo 0)"
 check "after a save" "3" "$(grep -c 'saved: WORLD IS SAVED' /tmp/entry.log)"
 check "and says stopped" "stopped" "$(jstate state)"
+check "with no invite code left" "None" "$(jstate inviteCode)"
 check "the server's files are uid 1000" "0" "$(find ${data}/Saved ${server} ! -uid 1000 | wc -l)"
+
+# --- Steam that never answers: the installed build starts anyway --------------------------------
+printf '#!/bin/bash\nexec sleep 1000\n' >/usr/local/bin/steamcmd
+FLUX_STEAMCMD_UPDATE_TIMEOUT=2 /opt/flux/flux-entrypoint.sh >/tmp/entry2.log 2>&1 &
+entry=$!
+check "a SteamCMD that hangs: the installed build starts" "0" "$(status wait_for '[ "$(jstate state)" = running ]' 40)"
+check "and says why" "1" "$(grep -c 'starting the build already installed' /tmp/entry2.log)"
+kill -TERM "${entry}"
+wait_for '! kill -0 ${entry} 2>/dev/null' 20
 
 # --- flux.log is local; the banner ----------------------------------------------------------------
 fl_srv=/mnt/soulmask/server

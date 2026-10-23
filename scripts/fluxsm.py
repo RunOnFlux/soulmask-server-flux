@@ -28,8 +28,15 @@
     flux-soulmask import <file>      a world.db (or one of our backups) uploaded to flux/uploads
                                      becomes the current map's world, the same way as a restore
     flux-soulmask new-world          the current map starts over on the next start (after a backup)
+    flux-soulmask whitelist          {"enabled", "ids": [{"id", "name"}]}
+    flux-soulmask whitelist add|remove <steamid64>   live when the server runs, else on file
+    flux-soulmask whitelist on|off   {"ok", "restart"}: live (`ssp 0`) and on every start (-serverpm)
 
-    fluxsm.py do-restore             apply a pending restore/import/new world (before a start)
+    fluxsm.py do-restore             apply a pending restore/import/new world (before a start);
+                                     its outcome is status.lastAction
+    fluxsm.py world-guard            before a start: exit 0 to start, 3 to wait (a world this
+                                     server had is missing and no backup has it)
+    fluxsm.py world-seen             the watcher, once up: this map's world exists
     fluxsm.py update-target <build>  remember the build a planned update restart is for
     fluxsm.py update-check           after the update step: a target that was not reached is
                                      remembered as failed (the watcher skips it for 6 hours)
@@ -87,6 +94,24 @@ TEMPLATES_DIR = os.path.join(SERVER_DIR, "WS", "Config", "GameplaySettings")
 LIVE_XISHU = os.path.join(SAVED_DIR, "GameplaySettings", "GameXishu.json")
 WORLDS_DIR = os.path.join(SAVED_DIR, "Worlds", "Dedicated")
 BAN_FILE = os.path.join(SAVED_DIR, "BlackAccountList.txt")
+WHITE_FILE = os.path.join(SAVED_DIR, "WhiteAccountList.txt")
+WHITELIST_FILE = os.path.join(STATE_DIR, "whitelist.json")
+PLAYER_NAMES = os.path.join(STATE_DIR, "player-names.json")
+# Which maps this server has had a world for, and a new world the panel asked for (world-guard).
+WORLDS_SEEN = os.path.join(STATE_DIR, "worlds.json")
+# When the world went missing, on THIS node (kept off the synced volume, so each node counts its
+# own wait), and how long the guard waits for Syncthing before it puts a backup back.
+WORLD_MISSING = os.path.join(SERVER_DIR, "flux-world-missing.json")
+WORLD_SYNC_GRACE = int(os.environ.get("FLUX_WORLD_SYNC_GRACE_SECONDS", "300"))
+CONFLICTS_DIR = os.path.join(STATE_DIR, "sync-conflicts")
+# What this image can do for the hub (status "features"). There is no kick: neither the console
+# nor RCON has one (build 26158199: `KickPlayer`, `gm KickPlayer`, `kick` are "Not Found!" on
+# both; `gm KickPlayer` is an in-game GM command of a player's client).
+FEATURES = {"kick": False, "whitelist": True}
+# -serverpm, the permission lists on at start (bits: 1 account whitelist, 2 account blacklist,
+# 4 IP whitelist, 8 IP blacklist, 16 mute). Without it the game starts with 2+8+16 (measured
+# with `lsp`, build 26158199), so bans work; the whitelist adds 1.
+SERVERPM_DEFAULT = 2 | 8 | 16
 BACKUP_NAME_RE = re.compile(r"^\d{8}-\d{6}-soulmask\.tar\.gz$")
 # The game's own hourly copies (BackupDatabaseByHour: YYYYmmddHH.db) and ours are not worlds.
 GAME_HOURLY_RE = re.compile(r"^\d{10}\.db$")
@@ -162,6 +187,12 @@ def clean_text(value, limit):
     return value[:limit]
 
 
+def clean_password(value, limit):
+    """A password for the command line: clean_text without whitespace (one word on the game's
+    command line, so the log filter can hide it whole)."""
+    return "".join(clean_text(value, 200).split())[:limit]
+
+
 def max_players(value):
     try:
         n = int(str(value).strip())
@@ -207,7 +238,7 @@ def admin_password():
     `gm key <password>` in the game's console)."""
     given = env("SM_ADMIN_PASSWORD")
     if given:
-        return clean_text(given, 64), "env"
+        return clean_password(given, 64), "env"
     try:
         with open(ADMIN_PW_FILE, encoding="utf-8") as f:
             kept = f.read().strip()
@@ -228,7 +259,7 @@ def current_settings():
     """What the environment asks for, with the image's defaults."""
     return {
         "name": clean_text(env("SM_SERVER_NAME") or "Soulmask on Flux", 64) or "Soulmask on Flux",
-        "password": clean_text(env("SM_PASSWORD") or "", 32),
+        "password": clean_password(env("SM_PASSWORD") or "", 32),
         "maxPlayers": max_players(env("SM_MAX_PLAYERS") or 20) or 20,
         "map": map_name(env("SM_MAP")) or "Level01_Main",
         "mode": mode_name(env("SM_MODE")) or "pve",
@@ -265,22 +296,27 @@ def known_keys():
     return set((base.get("0") or {}).keys()) - MODE_KEYS
 
 
-def merge_gameplay(panel, applied, live_blocks):
+def merge_gameplay(panel, applied, live_blocks, block):
     """The 3-way merge: returns (panel values to keep, keys adopted from the game).
 
-    A key whose value in the server's file differs from what the last start applied, and that
-    the panel did NOT change since, was changed in game (a GM's `sc`): the game's value wins."""
+    A key whose value in the server's file differs from what the last start (or apply-live)
+    applied, and that the panel did NOT change since, was changed in game (a GM's `sc`): the
+    game's value wins. Only `block` is compared, the one the server reads (MODE_BLOCK): `sc`
+    writes that block alone, so the other two still hold older values that mean nothing (comparing
+    them took a stale block "0" back into the panel and undid every apply-live, 1.0.1).
+
+    A key absent from the panel's file is not the panel's: it is never written, so the server's
+    (or the GM's) value stays. The hub writes only the keys it changed."""
     panel = dict(panel)
     adopted = []
+    current = live_blocks.get(block) or {}
     for key, was in applied.items():
         if key not in panel or number(panel[key]) != number(was):
             continue
-        for block in BLOCKS:
-            now = (live_blocks.get(block) or {}).get(key)
-            if now is not None and number(now) != number(was):
-                panel[key] = number(now)
-                adopted.append(key)
-                break
+        now = current.get(key)
+        if now is not None and number(now) != number(was):
+            panel[key] = number(now)
+            adopted.append(key)
     return panel, adopted
 
 
@@ -311,7 +347,7 @@ def apply_gameplay(notes):
             return
         notes.append("gameplay: GameXishu.json created from the game's template")
     keys = known_keys() or (set(live.get("0", {}).keys()) - MODE_KEYS)
-    panel, adopted = merge_gameplay(panel, applied, live)
+    panel, adopted = merge_gameplay(panel, applied, live, MODE_BLOCK[current_settings()["mode"]])
     if adopted:
         notes.append(f"gameplay: kept {len(adopted)} value(s) changed in game: {', '.join(sorted(adopted)[:8])}")
         write_json(GAMEPLAY_FILE, panel, indent=2)
@@ -429,14 +465,20 @@ def command_args(notes):
         args.append(f"-PSW={s['password']}")
     if s["mods"]:
         args.append(f"-mod={','.join(s['mods'])}")
+    extra_args = []
     extra = env("SM_EXTRA_ARGS")
     if extra:
         for part in extra.split():
             part = clean_text(part, 200)
             if part.startswith("-") and not re.match(r"^-(Port|QueryPort|EchoPort|MULTIHOME|adminpsw|PSW)=", part, re.I):
-                args.append(part)
+                extra_args.append(part)
             elif part:
                 notes.append(f"WARN SM_EXTRA_ARGS: {part!r} ignored (not an option, or one the image sets)")
+    # The permission lists on at start: the game's own default plus the whitelist when the panel
+    # turned it on. An -serverpm in SM_EXTRA_ARGS wins.
+    if not any(re.match(r"^-serverpm=", a, re.I) for a in extra_args):
+        args.append(f"-serverpm={serverpm_mask()}")
+    args += extra_args
     notes.append(f"{MAPS[s['map']]} ({s['map']}), {s['mode'].upper()}, {s['maxPlayers']} players, "
                  f"game UDP {s['gamePort']}, query UDP {s['queryPort']}, saves every {s['saveMinutes']} min, "
                  f"{'a join password' if s['password'] else 'no join password'}, GM password from "
@@ -474,6 +516,10 @@ def cmd_state(state, message=None):
     if state == "starting" and previous != "starting":
         data["generation"] = int(data.get("generation") or 0) + 1
         data.pop("inviteCode", None)
+    # A stopped server has no invite code to join with and no restart coming.
+    if state == "stopped":
+        for key in ("inviteCode", "nextRestart", "updateWaiting"):
+            data.pop(key, None)
     data.update({"state": state, "message": message or None,
                  "image": os.environ.get("FLUX_IMAGE_VERSION", "dev")})
     write_json(STATE_FILE, data, indent=None)
@@ -676,11 +722,13 @@ def cmd_status():
         "mode": s["mode"],
         "players": players,
         "max_players": s["maxPlayers"],
-        "inviteCode": state.get("inviteCode"),
+        "inviteCode": state.get("inviteCode") if state.get("state") != "stopped" else None,
         "passwordSet": bool(s["password"]),
         "mods": s["mods"],
         "gamePort": s["gamePort"],
         "queryPort": s["queryPort"],
+        "lastAction": state.get("lastAction"),
+        "features": dict(FEATURES),
     })
 
 
@@ -768,6 +816,105 @@ def cmd_ban(steam_id, add=True):
 
 
 # ------------------------------------------------------------------------------------------------
+# The whitelist: Saved/WhiteAccountList.txt (list 0 of the console's `usp` / `ssp`), written by
+# the game when `usp 0 1 <id>` adds one. Whether it is ON is ours (flux/whitelist.json): set live
+# with `ssp 0 1|0` and on every start with -serverpm (the game forgets `ssp` at a restart).
+# An enabled whitelist with nobody on it lets NOBODY in (the game says "Server is still
+# self-testing!"); the hub warns before turning it on.
+# ------------------------------------------------------------------------------------------------
+
+def whitelist_enabled():
+    data = read_json(WHITELIST_FILE, {}) or {}
+    return bool(data.get("enabled")) if isinstance(data, dict) else False
+
+
+def serverpm_mask():
+    return SERVERPM_DEFAULT | (1 if whitelist_enabled() else 0)
+
+
+def read_id_file(path):
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            return [line.strip() for line in f if line.strip()]
+    except OSError:
+        return []
+
+
+def write_id_file(path, ids):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        f.write("".join(f"{i}\n" for i in ids))
+    os.replace(path + ".tmp", path)
+
+
+def known_names(rows=None):
+    """SteamID64 -> player name, from `lap` rows when given (kept in flux/player-names.json for
+    when the server is down)."""
+    names = read_json(PLAYER_NAMES, {}) or {}
+    if not isinstance(names, dict):
+        names = {}
+    if rows:
+        fresh = {r["id"]: r["name"] for r in rows if r.get("id") and r.get("name")}
+        if any(names.get(k) != v for k, v in fresh.items()):
+            names.update(fresh)
+            try:
+                write_json(PLAYER_NAMES, names, indent=None)
+            except OSError:
+                pass
+    return names
+
+
+def cmd_whitelist(action=None, steam_id=None):
+    if action is None:
+        live, rows = None, None
+        if game_pids():
+            try:
+                perm, known = console_many(["lsp", "lap"], first_timeout=8.0)
+                live = parse_permissions(perm).get("WhiteAccountList")
+                rows = parse_all_players(known)
+            except OSError:
+                live = None
+        names = known_names(rows)
+        ids = live["values"] if live else read_id_file(WHITE_FILE)
+        enabled = live["enabled"] if live and live.get("enabled") is not None else whitelist_enabled()
+        out({"enabled": bool(enabled), "ids": [{"id": i, "name": names.get(i)} for i in ids]})
+        return
+    if action in ("on", "off"):
+        if steam_id is not None:
+            fail("usage: whitelist on|off", 64)
+        on = action == "on"
+        write_json(WHITELIST_FILE, {"enabled": on, "at": int(time.time())}, indent=None)
+        restart = False
+        if game_pids():
+            try:
+                reply = console(f"ssp 0 {1 if on else 0}", first_timeout=5.0)
+                restart = f"status is: {'ON' if on else 'OFF'}" not in reply
+            except OSError:
+                restart = True
+        out({"ok": True, "restart": restart})
+        return
+    if action in ("add", "remove"):
+        steam_id = str(steam_id or "").strip()
+        if not STEAM_ID_RE.match(steam_id):
+            fail("not a SteamID64 (17 digits, 7656119...)", 2)
+        add = action == "add"
+        if game_pids():
+            try:
+                if "done" in console(f"usp 0 {1 if add else 0} {steam_id}", first_timeout=5.0).lower():
+                    out({"ok": True})
+                    return
+            except OSError:
+                pass
+        ids = [i for i in read_id_file(WHITE_FILE) if i != steam_id]
+        if add:
+            ids.append(steam_id)
+        write_id_file(WHITE_FILE, ids)
+        out({"ok": True})
+        return
+    fail("usage: whitelist [on|off|add <id>|remove <id>]", 64)
+
+
+# ------------------------------------------------------------------------------------------------
 # Restarts
 # ------------------------------------------------------------------------------------------------
 
@@ -845,12 +992,22 @@ def backups_to_keep(names, keep, now):
     return kept
 
 
+def is_conflict(name):
+    """A Syncthing conflict copy (name.sync-conflict-<date>-<time>-<device>.ext): never a world,
+    never in a backup."""
+    return "sync-conflict" in os.path.basename(name)
+
+
+def no_conflicts(info):
+    return None if is_conflict(info.name) else info
+
+
 def world_files():
     """(path, arcname) of every world database: Saved/Worlds/Dedicated/<map>/*.db."""
     found = []
     for root, _dirs, files in os.walk(os.path.join(SAVED_DIR, "Worlds")):
         for f in files:
-            if f.endswith(".db") and not GAME_HOURLY_RE.match(f):
+            if f.endswith(".db") and not GAME_HOURLY_RE.match(f) and not is_conflict(f):
                 p = os.path.join(root, f)
                 found.append((p, os.path.relpath(p, DATA_DIR)))
     return sorted(found)
@@ -912,9 +1069,9 @@ def cmd_backup(why, force=None):
             for extra in ("GameplaySettings",):
                 p = os.path.join(SAVED_DIR, extra)
                 if os.path.isdir(p):
-                    t.add(p, arcname=os.path.relpath(p, DATA_DIR))
+                    t.add(p, arcname=os.path.relpath(p, DATA_DIR), filter=no_conflicts)
             for f in sorted(os.listdir(SAVED_DIR)) if os.path.isdir(SAVED_DIR) else []:
-                if f.endswith(".txt") and os.path.isfile(os.path.join(SAVED_DIR, f)):
+                if f.endswith(".txt") and not is_conflict(f) and os.path.isfile(os.path.join(SAVED_DIR, f)):
                     t.add(os.path.join(SAVED_DIR, f), arcname=os.path.relpath(os.path.join(SAVED_DIR, f), DATA_DIR))
             if os.path.isfile(GAMEPLAY_FILE):
                 t.add(GAMEPLAY_FILE, arcname=os.path.relpath(GAMEPLAY_FILE, DATA_DIR))
@@ -992,19 +1149,59 @@ def cmd_restore(name):
     pend("restore", name, f"restore {name}")
 
 
+def remove_upload(name):
+    try:
+        os.remove(os.path.join(UPLOADS_DIR, os.path.basename(str(name))))
+    except OSError:
+        pass
+
+
+def check_world_db(path):
+    """A Soulmask world: SQLite that passes quick_check and has the game's actor_table. Raises
+    ValueError with the reason otherwise."""
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            if con.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise ValueError("the database is damaged")
+            if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='actor_table'").fetchone():
+                raise ValueError("an SQLite database, but not a Soulmask world (no actor_table)")
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        raise ValueError(f"not a readable database ({e})")
+
+
+def world_usable(path):
+    try:
+        if os.path.getsize(path) == 0:
+            return False
+        check_world_db(path)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def cmd_import(name):
     """A file the owner uploaded to flux/uploads: a world.db (SQLite) becomes the current map's
-    world; one of our backups is restored whole."""
+    world; one of our backups is restored (see extract_backup). A file that is neither is refused
+    and removed."""
     if "/" in name or name.startswith(".") or not os.path.isfile(os.path.join(UPLOADS_DIR, name)):
         fail("no such file in flux/uploads", 2)
     path = os.path.join(UPLOADS_DIR, name)
     with open(path, "rb") as f:
         head = f.read(16)
     if head.startswith(b"SQLite format 3"):
+        try:
+            check_world_db(path)
+        except ValueError as e:
+            remove_upload(name)
+            fail(f"not a Soulmask world: {e}", 2)
         pend("import-db", name, f"import {name}")
     elif head[:2] == b"\x1f\x8b" and backup_maps(path):
         pend("import-backup", name, f"import {name}")
     else:
+        remove_upload(name)
         fail("not a Soulmask world (world.db) or one of this panel's backups", 2)
 
 
@@ -1012,24 +1209,55 @@ def cmd_new_world():
     pend("new-world", None, "a new world")
 
 
-def extract_backup(src):
-    """Our backup into Saved/ and flux/, through a staging folder. A broken archive changes nothing."""
+def remove_world(world_dir):
+    for f in ("world.db", "world.db-wal", "world.db-shm", "world.db-journal"):
+        try:
+            os.remove(os.path.join(world_dir, f))
+        except OSError:
+            pass
+
+
+def put_world(src, the_map):
+    """src (a checked world.db) becomes the_map's world, atomically."""
+    world_dir = os.path.join(WORLDS_DIR, the_map)
+    os.makedirs(world_dir, exist_ok=True)
+    shutil.copy2(src, os.path.join(world_dir, "world.db.flux-new"))
+    remove_world(world_dir)
+    os.replace(os.path.join(world_dir, "world.db.flux-new"), os.path.join(world_dir, "world.db"))
+
+
+def extract_backup(src, the_map, worlds_only=False):
+    """Our backup back, through a staging folder (a broken archive changes nothing).
+
+    The worlds: the_map's (the one this server runs) is replaced, and the backup must have it.
+    Another map's world in the backup is put back only where this server has no usable world
+    for that map, so restoring never rolls back (or deletes) the world of a map not in use.
+    Then, unless worlds_only: GameplaySettings, the permission lists and flux/gameplay.json."""
     staging = tempfile.mkdtemp(dir=DATA_DIR, prefix=".flux-restore-")
     try:
         with tarfile.open(src) as t:
-            members = [m for m in t.getmembers() if m.name.startswith(("Saved/", "flux/gameplay.json"))]
+            members = [m for m in t.getmembers() if m.name.startswith(("Saved/", "flux/gameplay.json"))
+                       and not is_conflict(m.name)]
             if not members or any(m.issym() or m.islnk() or ".." in m.name.split("/") for m in members):
                 raise ValueError("not a Soulmask backup")
+            if worlds_only:
+                members = [m for m in members if m.name.startswith("Saved/Worlds/")]
             t.extractall(staging, members=members, filter="data")
-        worlds_src = os.path.join(staging, "Saved", "Worlds")
-        if os.path.isdir(worlds_src):
-            old = os.path.join(SAVED_DIR, "Worlds.flux-old")
-            shutil.rmtree(old, ignore_errors=True)
-            if os.path.isdir(os.path.join(SAVED_DIR, "Worlds")):
-                os.replace(os.path.join(SAVED_DIR, "Worlds"), old)
-            os.makedirs(SAVED_DIR, exist_ok=True)
-            os.replace(worlds_src, os.path.join(SAVED_DIR, "Worlds"))
-            shutil.rmtree(old, ignore_errors=True)
+        worlds_src = os.path.join(staging, "Saved", "Worlds", "Dedicated")
+        mine = os.path.join(worlds_src, the_map, "world.db")
+        if not os.path.isfile(mine):
+            raise ValueError(f"the backup has no {MAPS.get(the_map, the_map)} world")
+        check_world_db(mine)
+        put_world(mine, the_map)
+        for other in sorted(os.listdir(worlds_src)):
+            db = os.path.join(worlds_src, other, "world.db")
+            if other == the_map or other not in MAPS or not os.path.isfile(db):
+                continue
+            if not world_usable(os.path.join(WORLDS_DIR, other, "world.db")) and world_usable(db):
+                put_world(db, other)
+                print(f"# the {MAPS[other]} world was missing here: put back from the backup too")
+        if worlds_only:
+            return
         gs = os.path.join(staging, "Saved", "GameplaySettings")
         if os.path.isdir(gs):
             shutil.rmtree(os.path.join(SAVED_DIR, "GameplaySettings"), ignore_errors=True)
@@ -1046,6 +1274,22 @@ def extract_backup(src):
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def iso_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def record_last_action(kind, name, ok, error=None):
+    """status.lastAction: the restore / import / new world the panel asked for, as the start that
+    applied (or refused) it saw it. generation = the start it belongs to (the one about to run)."""
+    data = read_json(STATE_FILE, {}) or {}
+    data["lastAction"] = {"kind": kind, "name": name, "generation": int(data.get("generation") or 0) + 1,
+                          "ok": bool(ok), "error": error, "at": iso_now()}
+    write_json(STATE_FILE, data, indent=None)
+
+
+ACTION_KIND = {"restore": "restore", "import-db": "import", "import-backup": "import", "new-world": "new-world"}
+
+
 def cmd_do_restore():
     """The supervisor, before a start: the pending restore, import or new world. A safety backup
     first; a broken archive or database leaves everything as it was."""
@@ -1057,48 +1301,173 @@ def cmd_do_restore():
     except OSError:
         pass
     action = pending.get("action", "restore")
-    name = pending.get("backup") or ""
+    kind = ACTION_KIND.get(action, action)
+    name = pending.get("backup") or None
     the_map = pending.get("map") if pending.get("map") in MAPS else current_settings()["map"]
     world_dir = os.path.join(WORLDS_DIR, the_map)
     try:
         if action == "restore":
-            src = os.path.join(BACKUP_DIR, name)
-            if not BACKUP_NAME_RE.match(name) or not os.path.isfile(src):
-                print(f"# WARN restore: {name} is not a backup; nothing restored")
-                return
+            src = os.path.join(BACKUP_DIR, name or "")
+            if not BACKUP_NAME_RE.match(name or "") or not os.path.isfile(src):
+                raise ValueError(f"{name} is not a backup")
             cmd_backup("before restoring " + name, "force")
-            extract_backup(src)
-            print(f"# restored {name}")
+            extract_backup(src, the_map)
+            print(f"# restored {name} ({MAPS[the_map]})")
         elif action == "import-backup":
-            src = os.path.join(UPLOADS_DIR, os.path.basename(name))
+            src = os.path.join(UPLOADS_DIR, os.path.basename(name or ""))
             cmd_backup("before importing " + name, "force")
-            extract_backup(src)
-            os.remove(src)
-            print(f"# imported the backup {name}")
+            extract_backup(src, the_map)
+            remove_upload(name)
+            print(f"# imported the backup {name} ({MAPS[the_map]})")
         elif action == "import-db":
-            src = os.path.join(UPLOADS_DIR, os.path.basename(name))
-            con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-            try:
-                if con.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                    raise ValueError("the database is damaged")
-            finally:
-                con.close()
+            src = os.path.join(UPLOADS_DIR, os.path.basename(name or ""))
+            check_world_db(src)
             cmd_backup("before importing " + name, "force")
-            os.makedirs(world_dir, exist_ok=True)
-            shutil.copy2(src, os.path.join(world_dir, "world.db.flux-new"))
-            os.replace(os.path.join(world_dir, "world.db.flux-new"), os.path.join(world_dir, "world.db"))
-            os.remove(src)
+            put_world(src, the_map)
+            remove_upload(name)
             print(f"# imported {name} as the {MAPS[the_map]} world")
         elif action == "new-world":
             cmd_backup("before a new world", "force")
-            for f in ("world.db", "world.db-wal", "world.db-shm", "world.db-journal"):
+            remove_world(world_dir)
+            seen = read_json(WORLDS_SEEN, {}) or {}
+            seen[the_map] = {"newWorld": int(time.time())}
+            write_json(WORLDS_SEEN, seen, indent=None)
+            print(f"# the {MAPS[the_map]} world starts over (the old one is in the backup just made)")
+        else:
+            raise ValueError(f"unknown action {action}")
+    except (OSError, tarfile.TarError, ValueError, sqlite3.Error) as e:
+        if action in ("import-db", "import-backup"):
+            remove_upload(name)
+        print(f"# WARN {action} of {name or the_map} failed ({e}); nothing changed")
+        record_last_action(kind, name, False, str(e))
+        return
+    record_last_action(kind, name, True)
+
+
+# ------------------------------------------------------------------------------------------------
+# The world guard (before every start). Flux runs this app on two nodes with the data volume
+# synced (Syncthing): a node can start on a volume whose world.db has not arrived yet, and the
+# game then makes a NEW world without a word, which syncs back over the real one. So: when the
+# map's world is missing (or unusable) but this server had one (flux/worlds.json, a backup with
+# that map, or other files in its folder), the game is not started on nothing: the newest backup
+# with that map is put back, or, with none, the start waits for the world to arrive. A new
+# world the panel asked for (new-world) is let through. Sync-conflict copies are moved aside.
+# ------------------------------------------------------------------------------------------------
+
+def quarantine_conflicts():
+    moved = []
+    for root, _dirs, files in os.walk(SAVED_DIR):
+        if os.path.islink(root) or os.path.basename(root) == "Logs":
+            continue
+        for f in files:
+            if is_conflict(f):
+                os.makedirs(CONFLICTS_DIR, exist_ok=True)
+                rel = os.path.relpath(os.path.join(root, f), SAVED_DIR).replace(os.sep, "__")
                 try:
-                    os.remove(os.path.join(world_dir, f))
+                    os.replace(os.path.join(root, f), os.path.join(CONFLICTS_DIR, rel))
+                    moved.append(rel)
                 except OSError:
                     pass
-            print(f"# the {MAPS[the_map]} world starts over (the old one is in the backup just made)")
-    except (OSError, tarfile.TarError, ValueError, sqlite3.Error) as e:
-        print(f"# WARN {action} of {name or the_map} failed ({e}); nothing changed")
+    return moved
+
+
+def mark_world_seen(the_map, db):
+    seen = read_json(WORLDS_SEEN, {}) or {}
+    if not isinstance(seen, dict):
+        seen = {}
+    seen[the_map] = {"seen": int(time.time()), "size": os.path.getsize(db)}
+    write_json(WORLDS_SEEN, seen, indent=None)
+
+
+def cmd_world_seen():
+    """The watcher, once the server is up: the current map's world exists (it is now one this
+    server must never silently replace)."""
+    the_map = current_settings()["map"]
+    db = os.path.join(WORLDS_DIR, the_map, "world.db")
+    if world_usable(db):
+        mark_world_seen(the_map, db)
+
+
+def cmd_world_guard():
+    """Exit 0: start the game (the world is there, was put back from a backup, or is a new one
+    on purpose). Exit 3: do not start, wait (the reason is the last line)."""
+    the_map = current_settings()["map"]
+    label = MAPS[the_map]
+    world_dir = os.path.join(WORLDS_DIR, the_map)
+    db = os.path.join(world_dir, "world.db")
+    for rel in quarantine_conflicts():
+        print(f"# WARN a Syncthing conflict copy {rel} was moved to flux/sync-conflicts/")
+    seen = read_json(WORLDS_SEEN, {}) or {}
+    entry = (seen.get(the_map) if isinstance(seen, dict) else None) or {}
+    if world_usable(db):
+        mark_world_seen(the_map, db)
+        try:
+            os.remove(WORLD_MISSING)
+        except OSError:
+            pass
+        return 0
+    if entry.get("newWorld"):
+        print(f"# a new {label} world, as the panel asked: the game makes one")
+        return 0
+    evidence = []
+    if entry.get("seen"):
+        evidence.append(f"this server ran it ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(entry['seen']))})")
+    with_map = [n for n in backup_files() if the_map in backup_maps(os.path.join(BACKUP_DIR, n))]
+    if with_map:
+        evidence.append(f"{len(with_map)} backup(s) have it")
+    leftovers = [f for f in (os.listdir(world_dir) if os.path.isdir(world_dir) else []) if not is_conflict(f)]
+    if leftovers:
+        evidence.append(f"its folder has {', '.join(sorted(leftovers)[:4])}")
+    if not evidence:
+        return 0
+    why = "missing" if not os.path.exists(db) else "unusable"
+    # Wait for Syncthing first. The backups are on the synced volume too and can arrive before the
+    # world.db: putting one back at once would give the file a new time, and Syncthing could then
+    # send that OLDER world over the real one still on its way. Only a missing world waits; an
+    # unusable one is not going to get better.
+    if why == "missing" and WORLD_SYNC_GRACE > 0:
+        missing = read_json(WORLD_MISSING, {}) or {}
+        since = missing.get(the_map) if isinstance(missing, dict) else None
+        if not isinstance(since, (int, float)):
+            since = time.time()
+            missing = missing if isinstance(missing, dict) else {}
+            missing[the_map] = since
+            write_json(WORLD_MISSING, missing, indent=None)
+        left = int(WORLD_SYNC_GRACE - (time.time() - since))
+        if left > 0:
+            print(f"The {label} world is missing on this node, but this server had one "
+                  f"({'; '.join(evidence)}). Waiting for it to sync before putting a backup back "
+                  f"(about {max(1, (left + 59) // 60)} min).")
+            return 3
+    if os.path.exists(db):
+        aside = f"{db}.flux-unusable-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}"
+        try:
+            os.replace(db, aside)
+            print(f"# WARN the {label} world.db is unusable: kept as {os.path.basename(aside)}")
+        except OSError:
+            pass
+    for name in with_map:
+        try:
+            extract_backup(os.path.join(BACKUP_DIR, name), the_map, worlds_only=True)
+        except (OSError, tarfile.TarError, ValueError, sqlite3.Error) as e:
+            print(f"# WARN the backup {name} could not be restored ({e}); trying an older one")
+            continue
+        mark_world_seen(the_map, db)
+        try:
+            os.remove(WORLD_MISSING)
+        except OSError:
+            pass
+        msg = (f"The {label} world was {why} on this node ({'; '.join(evidence)}): "
+               f"restored the newest backup that has it, {name}, instead of starting a new world")
+        print(f"# WARN {msg}")
+        data = read_json(STATE_FILE, {}) or {}
+        data["worldRestored"] = {"backup": name, "map": the_map, "at": iso_now(), "reason": why}
+        write_json(STATE_FILE, data, indent=None)
+        return 0
+    print(f"The {label} world is {why} on this node, but this server had one ({'; '.join(evidence)}) "
+          f"and no backup has it. Not starting a new world over it: waiting for it to sync. "
+          f"The panel's New world starts over instead.")
+    return 3
 
 
 # ------------------------------------------------------------------------------------------------
@@ -1158,6 +1527,9 @@ def main(argv):
         "import": (cmd_import, (1,)),
         "new-world": (cmd_new_world, (0,)),
         "do-restore": (cmd_do_restore, (0,)),
+        "world-guard": (lambda: sys.exit(cmd_world_guard()), (0,)),
+        "world-seen": (cmd_world_seen, (0,)),
+        "whitelist": (cmd_whitelist, (0, 1, 2)),
         "update-target": (cmd_update_target, (1,)),
         "update-check": (cmd_update_check, (0,)),
         "update-skip": (cmd_update_skip, (1,)),

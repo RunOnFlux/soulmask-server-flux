@@ -37,12 +37,44 @@ FLUX_UID="${FLUX_UID:-1000}"
 # One line, to the container's output and (when FLUX_LOG is set) to flux.log, rotated at
 # FLUX_LOG_MAX_BYTES (the old file becomes flux.log.1).
 flux_log_raw() {
-  printf '%s\n' "$1"
+  local line="$1"
+  # A password option on a line (the game's command line, an error quoting it) is never logged.
+  if [[ "${line,,}" == *psw=* ]]; then
+    line="$(printf '%s\n' "${line}" | flux_log_filter)"
+  fi
+  printf '%s\n' "${line}"
   if [ -n "${FLUX_LOG}" ] && mkdir -p "$(dirname "${FLUX_LOG}")" 2>/dev/null; then
-    printf '%s\n' "$1" >>"${FLUX_LOG}" 2>/dev/null || return 0
+    printf '%s\n' "${line}" >>"${FLUX_LOG}" 2>/dev/null || return 0
     flux_rotate_log "${FLUX_LOG}" "${FLUX_LOG_MAX_BYTES}"
   fi
   return 0
+}
+
+# stdin -> stdout, line by line (unbuffered): what the game's log may show. NUL bytes are dropped
+# (a log emptied under the game reads back as a run of them), and the value of -adminpsw=,
+# -PSW= and -rconpsw= (the game prints its whole command line at start) becomes <hidden>.
+flux_log_filter() {
+  sed -u -E -e 's/\x00//g' -e 's/(-(adminpsw|psw|rconpsw)=)("[^"]*"|[^ ]*)/\1<hidden>/Ig'
+}
+
+# Caps a log the game keeps open and writes at its own offset. $1 = the file, $2 = the most it may
+# take ON DISK, $3 = the bytes at its end to keep. Over $2, everything before the last $3 is
+# punched out (fallocate: the length stays, the start becomes a hole the disk does not hold);
+# where the filesystem cannot, the file is emptied (the readers filter the NULs that leaves).
+# Prints one line saying what it did; nothing when under the cap.
+flux_log_cap() {
+  local file="$1" max="$2" keep="$3" blocks bsize size disk len
+  read -r blocks bsize size < <(stat -c '%b %B %s' "${file}" 2>/dev/null) || return 0
+  disk=$((blocks * bsize))
+  [ "${disk}" -gt "${max}" ] 2>/dev/null || return 0
+  len=$(((size - keep) / 4096 * 4096))
+  if [ "${len}" -gt 0 ] && fallocate --punch-hole --offset 0 --length "${len}" "${file}" 2>/dev/null; then
+    printf 'the game log reached %s MB on disk: its first %s MB punched out (the last %s MB kept)\n' \
+      "$((disk / 1048576))" "$((len / 1048576))" "$((keep / 1048576))"
+  else
+    : >"${file}"
+    printf 'the game log reached %s MB on disk: emptied\n' "$((disk / 1048576))"
+  fi
 }
 
 flux_log() {

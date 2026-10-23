@@ -15,6 +15,10 @@ world_dir = os.path.join(saved, "Worlds", "Dedicated", the_map)
 os.makedirs(world_dir, exist_ok=True)
 xishu = os.path.join(saved, "GameplaySettings", "GameXishu.json")
 bans = os.path.join(saved, "BlackAccountList.txt")
+lists = {"0": os.path.join(saved, "WhiteAccountList.txt"), "1": bans}
+# The lists on at start: -serverpm=<bits>, else 2+8+16 (the game's own, measured 26158199).
+pm = next((int(a.split("=", 1)[1]) for a in sys.argv if a.lower().startswith("-serverpm=")), 26)
+enabled = {"0": bool(pm & 1), "1": bool(pm & 2)}
 exiting = []
 
 
@@ -22,6 +26,7 @@ def save():
     import sqlite3
     c = sqlite3.connect(os.path.join(world_dir, "world.db"))
     c.execute("create table if not exists t(v)")
+    c.execute("create table if not exists actor_table(actor_serial integer primary key, server_id integer)")
     c.execute("insert into t values (?)", (time.time(),))
     c.commit()
     c.close()
@@ -48,15 +53,26 @@ def answer(cmd):
         os.makedirs(os.path.dirname(xishu), exist_ok=True)
         json.dump(d, open(xishu, "w"))
         return "%s: %.3f (updated)\n" % (words[1], float(words[2]))
-    if w == "usp" and len(words) == 4:
-        ids = [l.strip() for l in open(bans)] if os.path.exists(bans) else []
+    if w == "usp" and len(words) == 4 and words[1] in lists:
+        f = lists[words[1]]
+        ids = [l.strip() for l in open(f)] if os.path.exists(f) else []
         ids = [i for i in ids if i and i != words[3]] + ([words[3]] if words[2] == "1" else [])
-        open(bans, "w").write("".join(i + "\n" for i in ids))
-        return "done.\n"
+        open(f, "w").write("".join(i + "\n" for i in ids))
+        return "Done.\n"
+    if w == "ssp" and len(words) == 3 and words[1] in lists:
+        enabled[words[1]] = words[2] == "1"
+        return "%s status is: %s\n" % ("WhiteAccountList" if words[1] == "0" else "BlackAccountList",
+                                        "ON" if enabled[words[1]] else "OFF")
     if w == "lsp":
-        ids = [l.strip() for l in open(bans)] if os.path.exists(bans) else []
-        return ("==== SERVER PERMISSION DETAILS ====\n1. BlackAccountList\n    status: Yes\n    values:\n"
-                + "".join("    |   %s\n" % i for i in ids))
+        text = "==== SERVER PERMISSION DETAILS ====\n"
+        for n, name in (("0", "WhiteAccountList"), ("1", "BlackAccountList")):
+            ids = [l.strip() for l in open(lists[n])] if os.path.exists(lists[n]) else []
+            text += "%s. %s\n    status: %s\n    values:\n" % (n, name, "Yes" if enabled[n] else "No")
+            text += "".join("    |   %s\n" % i for i in ids if i)
+        return text
+    if w == "lap":
+        return ("|              Account |                       PlayerName |      Guild |  Level | TotalOnline |   Birthday |\n"
+                "|    76561198000000001 |                        Chief Ana |            |     10 |        3600 | 2026-10-18 |\n")
     if w == "close" and len(words) == 2:
         exiting.append(time.time() + int(words[1]))
         return "server will close in %s seconds\n" % words[1]

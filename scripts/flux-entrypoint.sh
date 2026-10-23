@@ -7,8 +7,10 @@
 #   - every start: SteamCMD update, the game's Saved/ linked to the data volume, a pending
 #     restore / import / new world, a backup, GameXishu.json from the panel's gameplay settings
 #     and the command line from the environment (fluxsm.py apply), then the server as uid 1000
-#   - SIGTERM/SIGINT from Docker: a forced save on the game's console (`sav 1`, 4-5 s measured),
-#     then SIGKILL to the server at once (its own SIGTERM shutdown takes about 45 s, Flux allows
+#   - before the game starts, the world guard: a world this server had that is missing (a
+#     half-synced data volume) comes back from the newest backup, or the start waits for it
+#   - SIGTERM/SIGINT from Docker: a forced save on the game's console (`sav 1`, 2-4 s measured
+#     once the first, slow one is done before "running"), then SIGKILL to the server at once (its own SIGTERM shutdown takes about 45 s, Flux allows
 #     10 s in all); if the save does not answer within 8 s, SIGTERM and the last periodic save
 #   - a new build on Steam: an outdated server refuses players on the new client, so it is
 #     restarted onto it, when nobody is playing or after FLUX_UPDATE_WAIT_MINUTES with the
@@ -95,7 +97,7 @@ save_and_term() {
     # The game's own shutdown takes 45 s measured (it would be SIGKILLed at 10 s anyway) and the
     # world is on disk: with $2 = hard, end it now instead of leaving the container to Docker.
     if [ "${2:-}" = "hard" ]; then
-      sleep 1
+      sleep 0.3
       kill -KILL "${pid}" 2>/dev/null
       return 0
     fi
@@ -113,35 +115,77 @@ term_handler() {
 }
 trap term_handler TERM INT
 
+# One SteamCMD run with a deadline, in the background so a stop is not held up by it (bash runs
+# a trap only between foreground commands). $1 = seconds, the rest = SteamCMD's arguments.
+# Returns 124 on the deadline, 143 when the container is stopping.
+steamcmd_run() {
+  local limit="$1" pid rc
+  shift
+  timeout -k 10 "${limit}" steamcmd "$@" >/tmp/steamcmd.log 2>&1 &
+  pid=$!
+  wait "${pid}"
+  rc=$?
+  if [ "${terminating}" = "1" ]; then
+    kill "${pid}" 2>/dev/null
+    pkill -f 'steamcmd' 2>/dev/null
+    return 143
+  fi
+  return "${rc}"
+}
+
+# Installs or updates the server. A node that cannot reach Steam's CDN must not leave the
+# container "updating" forever: every SteamCMD run has a deadline (FLUX_STEAMCMD_TIMEOUT, 30 min
+# for a first install, FLUX_STEAMCMD_UPDATE_TIMEOUT 10 min over an install). With a build already
+# installed, two failed tries start that build; with none, it retries for ever with a growing
+# pause (30 s doubling to 10 min) and says so in the state. Returns 2 when stopping.
 update_server() {
-  local attempt validate
+  local attempt=0 validate="" limit rc pause=30 installed=0
   if flux_truthy "${SKIP_UPDATE:-}" && [ -x "${s}/WS/Binaries/Linux/${FLUX_GAME_PROCESS}" ]; then
     flux_log "SKIP_UPDATE is set: not updating the server files"
     return 0
   fi
   sm state updating "Downloading the server from Steam"
   flux_log "updating the server from Steam (app ${FLUX_STEAM_APP})"
-  validate=""
-  for attempt in 1 2 3 4 5; do
+  while true; do
+    attempt=$((attempt + 1))
+    installed=0
+    [ -x "${s}/WS/Binaries/Linux/${FLUX_GAME_PROCESS}" ] && installed=1
+    limit="${FLUX_STEAMCMD_TIMEOUT:-1800}"
+    [ "${installed}" = "1" ] && limit="${FLUX_STEAMCMD_UPDATE_TIMEOUT:-600}"
     # app_info_update + a second app_update in the same run: SteamCMD answers "Missing
     # configuration" to a first app_update now and then.
     # shellcheck disable=SC2086  # validate is "" or "validate"
-    if steamcmd +force_install_dir "${s}" +login anonymous +@sSteamCmdForcePlatformType linux +app_info_update 1 +app_update "${FLUX_STEAM_APP}" +app_update "${FLUX_STEAM_APP}" ${validate} +quit >/tmp/steamcmd.log 2>&1 \
-      && [ -x "${s}/WS/Binaries/Linux/${FLUX_GAME_PROCESS}" ]; then
+    steamcmd_run "${limit}" +force_install_dir "${s}" +login anonymous +@sSteamCmdForcePlatformType linux +app_info_update 1 +app_update "${FLUX_STEAM_APP}" +app_update "${FLUX_STEAM_APP}" ${validate} +quit
+    rc=$?
+    [ "${terminating}" = "1" ] && return 2
+    if [ "${rc}" = "0" ] && [ -x "${s}/WS/Binaries/Linux/${FLUX_GAME_PROCESS}" ]; then
       flux_log "server build $(flux_installed_build "${s}/steamapps/appmanifest_${FLUX_STEAM_APP}.acf")"
       return 0
     fi
-    [ "${terminating}" = "1" ] && return 1
+    local why
+    why="$(grep -aE 'ERROR|Error|error|Timeout|timed out' /tmp/steamcmd.log | tail -2 | tr '\n' ' ')"
+    [ "${rc}" = "124" ] && why="no answer within ${limit} s (Steam's servers unreachable from this node?) ${why}"
+    if [ "${installed}" = "1" ]; then
+      if [ "${attempt}" -ge "${FLUX_STEAMCMD_UPDATE_TRIES:-2}" ]; then
+        flux_log "WARN could not update from Steam (${why}); starting the build already installed ($(flux_installed_build "${s}/steamapps/appmanifest_${FLUX_STEAM_APP}.acf"))"
+        sm state updating "Steam did not answer: starting the build already installed"
+        return 0
+      fi
+      flux_log "WARN steamcmd failed (attempt ${attempt}): ${why}; retrying in 5s with validate"
+      validate="validate"
+      sleep 5 &
+      wait $!
+      continue
+    fi
+    flux_log "WARN the server could not be downloaded from Steam (attempt ${attempt}): ${why}; retrying in ${pause}s"
+    sm state updating "Could not download the server from Steam (attempt ${attempt}): retrying in ${pause} s"
     validate="validate"
-    flux_log "WARN steamcmd failed (attempt ${attempt}/5): $(grep -aE 'ERROR|Error|error' /tmp/steamcmd.log | tail -2 | tr '\n' ' ')retrying in 5s with validate"
-    sleep 5
+    sleep "${pause}" &
+    wait $!
+    [ "${terminating}" = "1" ] && return 2
+    pause=$((pause * 2))
+    [ "${pause}" -gt 600 ] && pause=600
   done
-  if [ -x "${s}/WS/Binaries/Linux/${FLUX_GAME_PROCESS}" ]; then
-    flux_log "WARN could not update from Steam; starting the build already installed"
-    return 0
-  fi
-  flux_log "ERROR could not install the server from Steam"
-  return 1
 }
 
 # The game writes everything it keeps under WS/Saved in the INSTALL, which is local to the node.
@@ -240,20 +284,17 @@ wait_for_empty() {
 }
 
 # shellcheck disable=SC2329  # run in the background below
-# The current game log, capped at FLUX_GAME_LOG_MAX_BYTES: its last 5 MB go to a rotated file and
-# the live one is emptied in place (the server keeps writing it).
+# The current game log, capped at FLUX_GAME_LOG_MAX_BYTES on disk. Unreal writes WS.log at its own
+# offset (no O_APPEND): emptying it (`: >`) only made a sparse file that read back as megabytes
+# of NUL bytes, into docker logs, every minute. Instead the old part is punched out
+# (flux_log_cap: the file keeps its length, its start reads as a hole, the disk is given back)
+# and the size that counts is what is on disk.
 log_capper() {
-  local current size
+  local current line
   current="$(flux_game_log)"
   while true; do
     sleep 60
-    size="$(stat -c %s "${current}" 2>/dev/null || echo 0)"
-    if [ "${size}" -gt "${FLUX_GAME_LOG_MAX_BYTES}" ] 2>/dev/null; then
-      tail -c 5242880 "${current}" >"${FLUX_GAME_LOG_DIR}/WS-flux-$(date -u +%Y%m%d-%H%M%S).log" 2>/dev/null
-      : >"${current}"
-      flux_prune "${FLUX_GAME_LOG_DIR}" 'WS-*.log' "${FLUX_GAME_LOG_KEEP}"
-      flux_log "the game log reached $((size / 1048576)) MB: rotated"
-    fi
+    line="$(flux_log_cap "${current}" "${FLUX_GAME_LOG_MAX_BYTES}" 5242880)" && [ -n "${line}" ] && flux_log "${line}"
   done
 }
 
@@ -281,11 +322,19 @@ watcher() {
     fi
     sleep 5
   done
+  # A first forced save BEFORE saying running: the first save of a session is the slow one (9.9 s
+  # and 10.7 s measured, 2-4 s after) and a stop's save has 8 s inside Docker's 10. Done here, the
+  # panel never shows a running server whose next save could not fit in a stop.
+  local t0
+  t0="$(date +%s%N)"
+  if timeout 40 python3 /opt/flux/fluxsm.py console "sav 1" 2>/dev/null | grep -q 'WORLD IS SAVED'; then
+    flux_log "first forced save in $((($(date +%s%N) - t0) / 1000000)) ms (the slow one; later ones take 2-4 s)"
+  else
+    flux_log "WARN the first forced save did not answer"
+  fi
+  sm world-seen
   sm state running
   flux_log "the server is up (generation ${generation})"
-  # A first forced save now: the first save of a session is the slow one (10.7 s and 5 s measured,
-  # 2.7 s after), and the next one may be the stop's, which has to fit in Docker's 10 s.
-  timeout 30 python3 /opt/flux/fluxsm.py console "sav 1" >/dev/null 2>&1 || true
   if [ -n "${restart_at}" ]; then
     next_restart="$(flux_next_daily "$(date -u +%s)" "${restart_at}")"
     sm note nextRestart "${next_restart}"
@@ -299,7 +348,9 @@ watcher() {
     if [ "${FLUX_UPDATE_CHECK_MINUTES}" -gt 0 ] 2>/dev/null && [ $((now - last_check)) -ge $((FLUX_UPDATE_CHECK_MINUTES * 60)) ]; then
       last_check="${now}"
       build="$(flux_installed_build "${s}/steamapps/appmanifest_${FLUX_STEAM_APP}.acf")"
-      public="$(steamcmd +login anonymous +app_info_update 1 +app_info_print "${FLUX_STEAM_APP}" +quit 2>/dev/null | flux_public_build)"
+      # A deadline: a SteamCMD that never answers would end the update checks and the daily
+      # restart for the whole generation.
+      public="$(timeout -k 10 "${FLUX_STEAMCMD_QUERY_TIMEOUT:-180}" steamcmd +login anonymous +app_info_update 1 +app_info_print "${FLUX_STEAM_APP}" +quit 2>/dev/null | flux_public_build)"
       if [ -n "${public}" ] && [ -n "${build}" ] && [ "${public}" != "${build}" ] && ! sm update-skip "${public}"; then
         flux_log "a new server build is on Steam (${build} -> ${public}): restarting onto it when the server is empty, at most ${FLUX_UPDATE_WAIT_MINUTES} min from now"
         sm note updateWaiting "${public}"
@@ -318,17 +369,53 @@ watcher() {
   done
 }
 
+# Before every start: a restore / import / new world the panel asked for, then the world guard
+# (fluxsm.py world-guard): never start the game on a missing world this server had, which on a
+# half-synced volume would make a new world and sync it over the real one. A restore from a backup
+# is said in flux.log and the state; with no backup it waits, checking every 30 s (the world may
+# still be on its way, or the panel may ask for a restore or a new world). Returns 1 when stopping.
+guard_world() {
+  local line out rc said=""
+  while true; do
+    while IFS= read -r line; do flux_log "restore: ${line#\# }"; done < <(sm do-restore 2>&1)
+    out="$(sm world-guard 2>&1)"
+    rc=$?
+    while IFS= read -r line; do
+      [ -n "${line}" ] && [[ "${line}" == "# "* ]] && flux_log "world: ${line#\# }"
+    done <<<"${out}"
+    if [ "${rc}" = "0" ]; then
+      line="$(grep -o 'restored the newest backup that has it, [^ ,]*' <<<"${out}" | head -1)"
+      [ -n "${line}" ] && world_note="the world was missing on this node: backup ${line#restored the newest backup that has it, } put back"
+      return 0
+    fi
+    line="$(grep -v '^# ' <<<"${out}" | tail -1)"
+    if [ "${said}" != "${line}" ]; then
+      flux_log "WARN ${line}"
+      said="${line}"
+    fi
+    sm state updating "${line}"
+    sleep 30 &
+    wait $!
+    [ "${terminating}" = "1" ] && return 1
+  done
+}
+
 start_generation() {
-  local line args=() current applied
+  local line args=() current applied rc
+  world_note=""
   generation=$((generation + 1))
   rm -f "${FLUX_RESTART_MARKER}" /tmp/flux-players.json
 
-  update_server || return 1
+  update_server
+  rc=$?
+  if [ "${rc}" = "2" ] || [ "${terminating}" = "1" ]; then
+    return 2
+  fi
+  [ "${rc}" = "0" ] || return 1
   while IFS= read -r line; do flux_log "${line#\# }"; done < <(sm update-check 2>&1)
   [ "${terminating}" = "1" ] && return 2
   link_saved
-  # A restore / import / new world the panel asked for, before anything reads the world.
-  while IFS= read -r line; do flux_log "restore: ${line#\# }"; done < <(sm do-restore 2>&1)
+  guard_world || return 2
   backup_world "start"
 
   # apply's stdout is the arguments (and "# " notes); its stderr is only ever logged.
@@ -356,13 +443,14 @@ start_generation() {
   own_files
   [ "${terminating}" = "1" ] && return 2
 
-  sm state starting "Loading the world"
+  sm state starting "Loading the world${world_note:+ (${world_note})}"
   flux_banner "Soulmask"
   flux_log "starting the server (generation ${generation})"
 
   # The game's log (Saved/Logs/WS.log), onto the container's output. The server's own stdout
   # repeats it with every level-streaming line, so it goes nowhere.
-  tail -n 0 -F "${current}" 2>/dev/null &
+  # flux_log_filter: no NUL bytes, and the passwords on the game's "Command Line:" line hidden.
+  tail -n 0 -F "${current}" 2>/dev/null | flux_log_filter &
   tail_pid=$!
 
   (

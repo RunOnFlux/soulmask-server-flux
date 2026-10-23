@@ -53,14 +53,25 @@ A change to what the image does bumps `VERSION` and gets a line under "Versions"
   forces a write (2.7 s warm, 10.7 s the first time). The stop path is `sav 1` then SIGKILL (SIGTERM shutdown measured 45 s on 2026-10-19): after
   SIGTERM the database closes ~7 s later and the process exits ~12 s later, past Docker's 10 s, so
   the forced save first is what makes a stop lose nothing.
-- **There is no kick** in the console (40 commands, none removes a player). Bans are `usp 1 1 <id>`,
-  written by the game to `Saved/BlackAccountList.txt` and read at start.
+- **There is no kick** in the console (40 commands, none removes a player), nor over RCON (same
+  command set; `KickPlayer`, `gm KickPlayer`, `kick` are "Not Found!", build 26158199). Bans are
+  `usp 1 1 <id>`, written by the game to `Saved/BlackAccountList.txt` and read at start. The
+  whitelist is list 0 (`usp 0 1 <id>`, `Saved/WhiteAccountList.txt`); `ssp 0 1` turns it on live but
+  is forgotten at a restart, so every start passes `-serverpm` (26 = the game's default, 27 with the
+  whitelist; `flux/whitelist.json` is the switch).
 - **GameXishu.json has three blocks**; a PvE server reads `"1"` (measured with `lc`). `apply` writes
   the panel's values into all three and never the PvP switch (`MODE_KEYS`): the mode is SM_MODE's.
   `sc` in game writes the active block at once; `apply` takes such values back into
-  flux/gameplay.json (3-way against flux/gameplay.applied.json) before writing.
+  flux/gameplay.json (3-way against flux/gameplay.applied.json) before writing, comparing ONLY the
+  mode's block (the other two hold stale values after any `sc`). A key absent from gameplay.json
+  is never written: the hub writes only the keys it changed.
 - **The difficulty templates leave block "1" alone** (Jiandan, Dashi... change only "0" and "2"):
   `preset_values` reads a template's changes from "0" and the mode's block.
+- **Never start the game on a missing world** (`world-guard`, before every start): on a half-synced
+  g: volume the game would make a new world that syncs over the real one.
+- **The game writes WS.log at its own offset (no O_APPEND).** Emptying it makes a sparse file that
+  reads back as NUL bytes; the cap punches the old part out (`flux_log_cap`), and everything shown
+  goes through `flux_log_filter` (no NULs, passwords hidden).
 - **World backups copy the SQLite database with its online-backup API** after a forced save: a plain
   copy of a database being written can be torn.
 - **The stdout of the server repeats its log with every level-streaming line.** It goes to
