@@ -39,6 +39,13 @@ check "restart time 24:00 refused" "1" "$(status flux_restart_time 24:00)"
 check "next 05:00 after noon is tomorrow" "$((1791720000 - 43200 + 86400 + 18000))" "$(flux_next_daily 1791720000 05:00)"
 check "next 13:30 after noon is today" "$((1791720000 + 5400))" "$(flux_next_daily 1791720000 13:30)"
 check "the time is the zone's (Lisbon is UTC+1 in October)" "$((1791720000 + 5400 - 3600))" "$(TZ=Europe/Lisbon flux_next_daily 1791720000 13:30)"
+check "restart time with spaces around it" "06:00" "$(flux_restart_time ' 06:00 ')"
+# Clock changes (Europe/Lisbon, 2026): 10-25 a 25 h day, 03-29 a 23 h day; New York 2027-03-14 skips 02:00-03:00.
+lis() { TZ=Europe/Lisbon date -d "@$(TZ=Europe/Lisbon flux_next_daily "$(TZ=Europe/Lisbon date -d "$1" +%s)" "$2")" '+%F %H:%M'; }
+check "the 25-hour day: 00:15 passed, the next is tomorrow's, not a repeat an hour on" "2026-10-26 00:15" "$(lis '2026-10-25 00:30' 00:15)"
+check "the 23-hour day: 23:30 asking for 23:00 gets the next day, not a skipped one" "2026-03-29 23:00" "$(lis '2026-03-28 23:30' 23:00)"
+ny() { TZ=America/New_York date -d "@$(TZ=America/New_York flux_next_daily "$(TZ=America/New_York date -d "$1" +%s)" "$2")" '+%F %H:%M'; }
+check "a time the clocks skip is taken an hour later, not turned off" "2027-03-14 03:30" "$(ny '2027-03-13 20:00' 02:30)"
 
 # --- Restart budget ----------------------------------------------------------------------------
 check "old restarts drop out of the window" "950 990" "$(flux_restarts_in_window 1000 100 800 950 990)"
@@ -227,9 +234,23 @@ check "junk is refused" "2" "$(status sm import junk.db)"
 sm new-world >/dev/null
 sm do-restore >/dev/null
 check "a new world removes the map's world" "1" "$(status test -f "${world}/world.db")"
+# `lp` always answers with the table header, even with nobody on: an empty answer is a console that did not answer.
+check "no header = no answer, not nobody" "False" "$(py "print(fluxsm.has_table(''))")"
+check "the bare header is an empty server" "True" "$(py "print(fluxsm.has_table(sys.argv[1]))" '|   Account |  PlayerName |')"
 check "lastAction says so" "new-world True None" "$(sm status | python3 -c 'import json,sys;a=json.load(sys.stdin)["lastAction"];print(a["kind"],a["ok"],a["name"])')"
 mkworld() { python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("create table if not exists actor_table(actor_serial integer primary key, v)"); c.execute("insert into actor_table(v) values (?)",(sys.argv[2],)); c.commit()' "$@"; }
 wcount() { python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("select count(*) from actor_table").fetchone()[0])' "$1"; }
+# A safety backup that FAILS (the backups folder cannot be written) stops a new world: the copy it promised is not there.
+mkworld "${world}/world.db" "keep-me"
+chmod 555 "${data}/flux/backups" 2>/dev/null
+FLUX_BACKUP_MIN_AGE_MINUTES=0 sm new-world >/dev/null
+sm do-restore >"${tmp}/nw-fail.out" 2>&1
+chmod 755 "${data}/flux/backups"
+if [ "$(id -u)" = "0" ]; then :; else
+  check "a failed safety backup keeps the world" "0" "$(status test -f "${world}/world.db")"
+  check "and lastAction says it failed" "False" "$(sm status | python3 -c 'import json,sys;print(json.load(sys.stdin)["lastAction"]["ok"])')"
+fi
+rm -f "${world}/world.db"
 
 # The world guard. A new world the panel asked for is let through.
 check "guard: a new world asked for starts" "0" "$(status sm world-guard)"

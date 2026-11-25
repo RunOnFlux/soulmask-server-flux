@@ -644,6 +644,10 @@ def parse_table(text):
     return out_rows
 
 
+def has_table(text):
+    return "Account" in (text or "")
+
+
 def parse_players(text):
     """`lp` (List_OnlinePlayers): | Account | PlayerName | PawnID | Position |."""
     players = []
@@ -676,9 +680,12 @@ def online_players(max_age=15):
     if isinstance(cached, dict) and now - cached.get("at", 0) < max_age:
         return cached.get("players")
     try:
-        players = parse_players(console("lp", first_timeout=5.0))
+        reply = console("lp", first_timeout=5.0)
     except OSError:
         return None
+    if not has_table(reply):
+        return None
+    players = parse_players(reply)
     try:
         write_json(PLAYERS_CACHE, {"at": now, "players": players}, indent=None)
     except OSError:
@@ -693,7 +700,11 @@ def cmd_players():
         online, known = console_many(["lp", "lap"], first_timeout=8.0)
     except OSError as e:
         fail(f"the server's console did not answer ({e})", 4)
-    out({"online": parse_players(online), "all": parse_all_players(known)})
+    # Even with nobody on, the game answers `lp` with the table's header row. An EMPTY answer is a console that
+    # did not answer, which must not read as "nobody is on" (the daily restart would not wait for anyone).
+    if not has_table(online):
+        fail("the server's console did not answer", 4)
+    out({"online": parse_players(online), "all": parse_all_players(known) if has_table(known) else None})
 
 
 # ------------------------------------------------------------------------------------------------
@@ -1026,6 +1037,14 @@ def sqlite_copy(src, dst):
         s.close()
 
 
+def safety_backup(why):
+    """The backup before something that replaces or deletes the world. A backup that FAILED (full disk, no
+    permission) stops the action: the owner was promised a copy to restore from. A skipped one (no world yet,
+    one made a moment ago) does not."""
+    if cmd_backup(why, "force") is False:
+        raise ValueError("the safety backup could not be made")
+
+
 def cmd_backup(why, force=None):
     names = backup_files()
     now = int(time.time())
@@ -1082,7 +1101,7 @@ def cmd_backup(why, force=None):
         except OSError:
             pass
         print(f"# WARN backup ({why}) failed: {e}")
-        return None
+        return False
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     index = read_json(BACKUP_INDEX, {}) or {}
@@ -1310,24 +1329,24 @@ def cmd_do_restore():
             src = os.path.join(BACKUP_DIR, name or "")
             if not BACKUP_NAME_RE.match(name or "") or not os.path.isfile(src):
                 raise ValueError(f"{name} is not a backup")
-            cmd_backup("before restoring " + name, "force")
+            safety_backup("before restoring " + name)
             extract_backup(src, the_map)
             print(f"# restored {name} ({MAPS[the_map]})")
         elif action == "import-backup":
             src = os.path.join(UPLOADS_DIR, os.path.basename(name or ""))
-            cmd_backup("before importing " + name, "force")
+            safety_backup("before importing " + name)
             extract_backup(src, the_map)
             remove_upload(name)
             print(f"# imported the backup {name} ({MAPS[the_map]})")
         elif action == "import-db":
             src = os.path.join(UPLOADS_DIR, os.path.basename(name or ""))
             check_world_db(src)
-            cmd_backup("before importing " + name, "force")
+            safety_backup("before importing " + name)
             put_world(src, the_map)
             remove_upload(name)
             print(f"# imported {name} as the {MAPS[the_map]} world")
         elif action == "new-world":
-            cmd_backup("before a new world", "force")
+            safety_backup("before a new world")
             remove_world(world_dir)
             seen = read_json(WORLDS_SEEN, {}) or {}
             seen[the_map] = {"newWorld": int(time.time())}

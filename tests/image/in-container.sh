@@ -153,6 +153,18 @@ check "and says why" "1" "$(grep -c 'starting the build already installed' /tmp/
 kill -TERM "${entry}"
 wait_for '! kill -0 ${entry} 2>/dev/null' 20
 
+# --- Steam answers "state is 0x6" (exit 0 or not) for an install that is there: not retried, it starts ----------
+check "the depotcache is on the install volume" "/mnt/soulmask/server/flux-steam/depotcache" "$(readlink "${HOME:-/root}/.local/share/Steam/depotcache")"
+printf '#!/bin/bash\necho call >>/tmp/steamcmd-calls\necho "Error! App 3017300 state is 0x6 after update job."\nexit 0\n' >/usr/local/bin/steamcmd
+: >/tmp/steamcmd-calls
+/opt/flux/flux-entrypoint.sh >/tmp/entry6.log 2>&1 &
+entry=$!
+check "a 0x6 (exit 0) starts the installed build" "0" "$(status wait_for '[ "$(jstate state)" = running ]' 40)"
+check "after ONE steamcmd call" "1" "$(wc -l </tmp/steamcmd-calls)"
+check "and says why" "1" "$(grep -c 'state is 0x6' /tmp/entry6.log)"
+kill -TERM "${entry}"
+wait_for '! kill -0 ${entry} 2>/dev/null' 20
+
 # --- flux.log is local; the banner ----------------------------------------------------------------
 fl_srv=/mnt/soulmask/server
 fl_data=/mnt/soulmask/data
